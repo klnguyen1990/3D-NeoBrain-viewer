@@ -1,5 +1,5 @@
 #define AppName "Visualiseur DICOM Multi-Vues"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppExeName "DicomViewerApp.exe"
 #define AppPublisher "CREATIS Lyon"
 
@@ -11,6 +11,7 @@ AppPublisher={#AppPublisher}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
+DisableDirPage=no
 OutputDir=installer
 OutputBaseFilename=DicomViewerApp_Setup_v{#AppVersion}
 Compression=lzma2/ultra64

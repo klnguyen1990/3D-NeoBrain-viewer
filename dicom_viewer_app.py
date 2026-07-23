@@ -55,8 +55,37 @@ _COLOR_CORONAL = "#5555FF"
 _COLOR_SAGITTAL = "#55FF55"
 _COLOR_REFERENCE = "#FFD166"
 
+# Couleur d'accent unique pour tout ce qui est "sélectionné/actif" dans
+# l'appli : élément de menu survolé, ligne sélectionnée, zone de dépôt
+# glisser-déposer active, statut de chargement, poignée de slider.
+_COLOR_HIGHLIGHT = "#2196F3"
+_COLOR_HIGHLIGHT_HOVER = "#64B5F6"
+_COLOR_HIGHLIGHT_BORDER = "#1565C0"
+
+_COLOR_RESET_BTN = "#9E9E9E"
+_COLOR_RESET_BTN_HOVER = "#BDBDBD"
+_COLOR_RESET_BTN_BORDER = "#757575"
+
 _STATUS_STYLE_NORMAL = "color: #999999; font-size: 13px; margin-top: 15px;"
-_STATUS_STYLE_LOADING = "color: #00E5FF; font-size: 13px; font-weight: bold; margin-top: 15px;"
+_STATUS_STYLE_LOADING = f"color: {_COLOR_HIGHLIGHT}; font-size: 13px; font-weight: bold; margin-top: 15px;"
+
+_MENU_STYLE = f"""
+    QMenu {{
+        background-color: #1e1e2e;
+        color: white;
+        border: 1px solid #444;
+        padding: 4px;
+    }}
+    QMenu::item {{
+        padding: 12px 28px;
+        font-size: 14px;
+        border-radius: 4px;
+    }}
+    QMenu::item:selected {{
+        background-color: {_COLOR_HIGHLIGHT};
+        color: #000000;
+    }}
+"""
 
 
 def _resource_path(name: str) -> Path:
@@ -233,7 +262,7 @@ class _DropButton(QPushButton):
         self._set_drag_active(False)
 
     def _set_drag_active(self, active: bool):
-        border = "2px dashed #00E5FF" if active else "1px solid #333"
+        border = f"2px dashed {_COLOR_HIGHLIGHT}" if active else "1px solid #333"
         bg = "#26364a" if active else "#1e1e2e"
         self.setStyleSheet(self._STYLE.format(bg=bg, border=border))
 
@@ -336,23 +365,7 @@ class DicomViewerWindow(QMainWindow):
             "Cliquez pour choisir, ou glissez-déposez directement le fichier/dossier ici."
         )
         menu_vol = QMenu(btn_vol)
-        menu_vol.setStyleSheet("""
-            QMenu {
-                background-color: #1e1e2e;
-                color: white;
-                border: 1px solid #444;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 12px 28px;
-                font-size: 14px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #00E5FF;
-                color: #000000;
-            }
-        """)
+        menu_vol.setStyleSheet(_MENU_STYLE)
         menu_vol.addAction("Fichier DICOM (multi-trame)…", self.action_load_volume_file)
         menu_vol.addAction("Dossier (série de coupes)…", self.action_load_volume_folder)
         btn_vol.setMenu(menu_vol)
@@ -384,12 +397,12 @@ class DicomViewerWindow(QMainWindow):
 
         self.btn_reset = QPushButton("RESET VIEWS")
         self.btn_reset.setMinimumHeight(58)
-        self.btn_reset.setStyleSheet("""
-            QPushButton {
-                background-color: #00E5FF; color: #000000; font-weight: bold;
-                font-size: 17px; border-radius: 8px; border: 2px solid #00B8D4;
-            }
-            QPushButton:hover { background-color: #64FFDA; }
+        self.btn_reset.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {_COLOR_RESET_BTN}; color: #000000; font-weight: bold;
+                font-size: 17px; border-radius: 8px; border: 2px solid {_COLOR_RESET_BTN_BORDER};
+            }}
+            QPushButton:hover {{ background-color: {_COLOR_RESET_BTN_HOVER}; }}
         """)
         self.btn_reset.clicked.connect(self.reset_views)
         sidebar.addWidget(self.btn_reset)
@@ -422,12 +435,13 @@ class DicomViewerWindow(QMainWindow):
 
         self.list_history = QListWidget()
         self.list_history.setToolTip("Clic droit : ouvrir le dossier ou retirer de la liste.")
-        self.list_history.setStyleSheet("""
-            QListWidget {
+        self.list_history.setStyleSheet(f"""
+            QListWidget {{
                 background-color: #0d0d0d; color: #dddddd; border: 1px solid #333;
                 border-radius: 4px; font-size: 14px; font-weight: bold;
-            }
-            QListWidget::item { padding: 7px 5px; border-bottom: 1px solid #222; }
+            }}
+            QListWidget::item {{ padding: 7px 5px; border-bottom: 1px solid #222; }}
+            QListWidget::item:selected {{ background-color: {_COLOR_HIGHLIGHT}; color: #000000; }}
         """)
         self.list_history.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_history.customContextMenuRequested.connect(self._show_history_context_menu)
@@ -459,12 +473,12 @@ class DicomViewerWindow(QMainWindow):
         lbl.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 16px; margin-top: 15px;")
         slider = QSlider(Qt.Horizontal)
         slider.setMinimumHeight(28)
-        slider.setStyleSheet("""
-            QSlider::groove:horizontal { height: 8px; background: #333; border-radius: 4px; }
-            QSlider::handle:horizontal {
+        slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{ height: 8px; background: #333; border-radius: 4px; }}
+            QSlider::handle:horizontal {{
                 width: 22px; height: 22px; margin: -8px 0;
-                background: #00E5FF; border-radius: 11px;
-            }
+                background: {_COLOR_HIGHLIGHT}; border-radius: 11px;
+            }}
         """)
         slider.setRange(0, max_val - 1)
         slider.setValue(max_val // 2)
@@ -868,8 +882,13 @@ class DicomViewerWindow(QMainWindow):
         item = self.list_history.itemAt(pos)
         if item is None:
             return
+        # Un clic droit n'affecte pas la sélection par défaut dans un
+        # QListWidget (contrairement au clic gauche) : on la force ici pour
+        # que la ligne visée par le menu soit visuellement mise en évidence.
+        self.list_history.setCurrentItem(item)
         data = item.data(Qt.UserRole)
         menu = QMenu(self.list_history)
+        menu.setStyleSheet(_MENU_STYLE)
         menu.addAction("Ouvrir le dossier", lambda: self._open_folder(data["directory"]))
         menu.addAction("Retirer de la liste", lambda: self._remove_history_item(item))
         menu.exec(self.list_history.mapToGlobal(pos))
