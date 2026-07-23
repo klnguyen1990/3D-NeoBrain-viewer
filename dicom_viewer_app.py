@@ -442,7 +442,24 @@ class DicomViewerWindow(QMainWindow):
             }}
             QListWidget::item {{ padding: 7px 5px; border-bottom: 1px solid #222; }}
             QListWidget::item:selected {{ background-color: {_COLOR_HIGHLIGHT}; color: #000000; }}
+            QScrollBar:horizontal {{
+                height: 14px; background: #0d0d0d; border-top: 1px solid #333;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {_COLOR_HIGHLIGHT}; min-width: 30px; border-radius: 6px; margin: 2px;
+            }}
+            QScrollBar::handle:horizontal:hover {{ background: {_COLOR_HIGHLIGHT_HOVER}; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: none; }}
         """)
+        # Un chemin de dossier peut dépasser largement la largeur de la
+        # barre latérale : plutôt que de le tronquer, on affiche tout et on
+        # laisse chaque ligne défiler horizontalement (barre visible en bas
+        # de la liste, cf. QScrollBar:horizontal ci-dessus).
+        self.list_history.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.list_history.setHorizontalScrollMode(QListWidget.ScrollPerPixel)
+        self.list_history.setWordWrap(False)
+        self.list_history.setTextElideMode(Qt.ElideNone)
         self.list_history.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_history.customContextMenuRequested.connect(self._show_history_context_menu)
         sidebar.addWidget(self.list_history, 1)
@@ -687,6 +704,9 @@ class DicomViewerWindow(QMainWindow):
         load_id = self._load_counter
         item = QListWidgetItem(f"{label}\n{directory}")
         item.setData(Qt.UserRole, {"kind": kind, "load_id": load_id, "directory": directory})
+        # Complète la barre de défilement horizontale : le chemin complet
+        # est aussi lisible d'un simple survol, sans avoir à faire défiler.
+        item.setToolTip(f"{label}\n{directory}")
         self.list_history.addItem(item)
         self.list_history.scrollToBottom()
         return load_id
