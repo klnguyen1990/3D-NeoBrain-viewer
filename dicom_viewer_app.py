@@ -191,7 +191,11 @@ def load_volume_from_folder(folder: Path):
             reader.SetFileNames(names)
             img = reader.Execute()
             arr = _to_grayscale(sitk.GetArrayFromImage(img).astype(np.float64))  # (Z,Y,X)
+            arr = np.transpose(arr, (1, 0, 2))
+            #arr = np.transpose(arr, (2, 1, 0))
             sx, sy, _sz = img.GetSpacing()
+            print(arr.shape)
+            print('OK.....S')
             return arr, (sy, sx)
 
     # Repli sans SimpleITK (ou dossier non reconnu comme série GDCM).
