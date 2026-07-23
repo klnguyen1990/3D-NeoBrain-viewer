@@ -1,0 +1,5 @@
+PySide6>=6.5.0
+numpy>=1.20.0
+pydicom>=2.1.0
+matplotlib>=3.3.0
+SimpleITK>=2.1.0
