@@ -1,5 +1,5 @@
 #define AppName "Visualiseur DICOM Multi-Vues"
-#define AppVersion "1.1.2"
+#define AppVersion "1.1.3"
 #define AppExeName "DicomViewerApp.exe"
 #define AppPublisher "CREATIS Lyon"
 

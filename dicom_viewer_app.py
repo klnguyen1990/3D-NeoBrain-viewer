@@ -125,28 +125,92 @@ def _extract_spacing(ds) -> "tuple[float, float] | None":
             sp = ds.PerFrameFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing
         except Exception:
             pass
-    if sp is None:
-        # Repli échographie : régions US portent leur propre delta physique.
+    if sp is not None:
+        # PixelSpacing (et assimilés) est toujours en mm au standard DICOM ;
+        # l'appli affiche tout en cm.
         try:
-            region = ds.SequenceOfUltrasoundRegions[0]
-            dx = float(getattr(region, "PhysicalDeltaX", 0))
-            dy = float(getattr(region, "PhysicalDeltaY", dx))
-            if dx > 0:
-                sp = [dy, dx]
+            return float(sp[0]) / 10, float(sp[1]) / 10
+        except Exception:
+            return None
+
+    # Repli échographie : régions US portent leur propre delta physique, déjà
+    # en cm quand PhysicalUnits{X,Y}Direction = 3 (le cas usuel pour une
+    # calibration spatiale) -- sinon on ne sait pas l'interpréter comme une
+    # distance, donc on abandonne ce repli.
+    try:
+        region = ds.SequenceOfUltrasoundRegions[0]
+        dx = float(getattr(region, "PhysicalDeltaX", 0))
+        dy = float(getattr(region, "PhysicalDeltaY", dx))
+        if (dx > 0
+                and int(getattr(region, "PhysicalUnitsXDirection", -1)) == 3
+                and int(getattr(region, "PhysicalUnitsYDirection", -1)) == 3):
+            return dy, dx
+    except Exception:
+        pass
+    return None
+
+
+def _extract_slice_spacing(ds) -> "float | None":
+    """Retourne l'espacement (cm) entre coupes/trames successives, si disponible
+    (SpacingBetweenSlices, ou à défaut SliceThickness comme approximation)."""
+    val = ds.get("SpacingBetweenSlices")
+    if val is None:
+        try:
+            val = ds.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].SpacingBetweenSlices
         except Exception:
             pass
-    if sp is None:
+    if val is None:
+        try:
+            val = ds.PerFrameFunctionalGroupsSequence[0].PixelMeasuresSequence[0].SpacingBetweenSlices
+        except Exception:
+            pass
+    if val is None:
+        val = ds.get("SliceThickness")
+    if val is None:
+        try:
+            val = ds.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].SliceThickness
+        except Exception:
+            pass
+    if val is None:
+        try:
+            val = ds.PerFrameFunctionalGroupsSequence[0].PixelMeasuresSequence[0].SliceThickness
+        except Exception:
+            pass
+    if val is None:
         return None
     try:
-        return float(sp[0]), float(sp[1])
+        return float(val) / 10  # SpacingBetweenSlices/SliceThickness sont en mm
     except Exception:
         return None
 
 
-def _spacing_str(sp) -> str:
-    if sp is None:
-        return "spacing ?"
-    return f"{sp[0]:.3g} × {sp[1]:.3g} cm"
+def _extract_volume_spacing(ds) -> "tuple[float | None, float, float] | None":
+    """Retourne (trame, ligne, colonne) en cm, dans l'ordre NATIF de pixel_array
+    (avant toute transposition) : espacement inter-coupes, puis espacement dans
+    le plan. L'élément inter-coupes est None si l'information n'est pas
+    renseignée dans le DICOM (le plan reste alors correctement proportionné,
+    seule la profondeur retombe sur un pas carré). Si l'appelant transpose le
+    tableau de pixels, il doit appliquer la même permutation à ce triplet."""
+    spacing_yx = _extract_spacing(ds)
+    if spacing_yx is None:
+        return None
+    return (_extract_slice_spacing(ds), spacing_yx[0], spacing_yx[1])
+
+
+def _spacing_table_html(title: str, dim_str, spacing_str) -> str:
+    """Tableau HTML (dimension + spacing) pour un élément chargé (Volume ou
+    Référence), affiché dans le QLabel de statut (rich text)."""
+    if dim_str is None:
+        suffix = "e" if title == "Référence" else ""
+        return f"<p style='color:#999; margin:2px 0 8px 0;'>{title} : non chargé{suffix}</p>"
+    return (
+        f"<p style='margin:4px 0 2px 0;'><b>{title}</b></p>"
+        f"<table style='margin:0 0 8px 0;'>"
+        f"<tr><th style='padding-right:8px; text-align:left; color:#999;'>Dimension</th>"
+        f"<th style='text-align:left; color:#999;'>Spacing</th></tr>"
+        f"<tr><td style='padding-right:8px;'>{dim_str} px</td><td>{spacing_str} cm</td></tr>"
+        f"</table>"
+    )
 
 
 def _to_uint8(arr: np.ndarray) -> np.ndarray:
@@ -156,10 +220,54 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
     return ((arr - lo) / (hi - lo) * 255).astype(np.uint8)
 
 
+def _extract_region_crop(ds) -> "tuple[int, int, int, int] | None":
+    """Retourne (y0, y1, x0, x1) : la zone de balayage échographique utile
+    (SequenceOfUltrasoundRegions), qui exclut le texte/logo incrustés autour
+    par le scanner. None si le tag est absent."""
+    try:
+        region = ds.SequenceOfUltrasoundRegions[0]
+        x0 = int(region.RegionLocationMinX0)
+        y0 = int(region.RegionLocationMinY0)
+        x1 = int(region.RegionLocationMaxX1)
+        y1 = int(region.RegionLocationMaxY1)
+    except Exception:
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (y0, y1, x0, x1)
+
+
+_EXTRA_CROP_PX = 50  # marge additionnelle (côtés latéraux + bas, pas le haut) retirée
+                     # après le recadrage par tag DICOM : la région déclarée par le
+                     # scanner y laisse encore parfois des annotations (ex. "DROIT").
+
+
+def _crop_to_region(arr: np.ndarray, ds) -> np.ndarray:
+    """Recadre arr (dont les 2 derniers axes sont lignes,colonnes) sur la
+    zone de balayage échographique si le DICOM la renseigne ; sinon renvoie
+    arr inchangé. L'espacement physique par pixel n'est pas affecté par un
+    recadrage (seule l'étendue change), donc aucun ajustement de spacing
+    n'est nécessaire côté appelant."""
+    crop = _extract_region_crop(ds)
+    if crop is None:
+        return arr
+    y0, y1, x0, x1 = crop
+    y1, x1 = min(y1, arr.shape[-2]), min(x1, arr.shape[-1])
+    if y1 <= y0 or x1 <= x0:
+        return arr
+
+    x0m = min(x0 + _EXTRA_CROP_PX, x1 - 1)
+    x1m = max(x1 - _EXTRA_CROP_PX, x0m + 1)
+    y1m = max(y1 - _EXTRA_CROP_PX, y0 + 1)
+    if y1m <= y0 or x1m <= x0m:
+        return arr[..., y0:y1, x0:x1]  # marge trop grande pour cette image : recadrage région seul
+    return arr[..., y0:y1m, x0m:x1m]
+
+
 def load_volume_from_file(path: Path):
     """Charge un volume 3D depuis un fichier DICOM multi-trame unique.
 
-    Retourne (volume (Z,Y,X) float64, spacing_yx | None).
+    Retourne (volume (Z,Y,X) float64, spacing_zyx | None).
     """
     size_mb = path.stat().st_size / (1024 * 1024)
     print(f"Chargement du volume/séquence « {path.name} » ({size_mb:.0f} Mo)…")
@@ -175,14 +283,19 @@ def load_volume_from_file(path: Path):
     if arr.ndim != 3:
         raise ValueError(f"Forme de pixel_array inattendue {arr.shape} dans « {path.name} ».")
 
+    arr = _crop_to_region(arr, ds)
     arr = np.transpose(arr, (1, 0, 2))
-    return arr.astype(np.float64), _extract_spacing(ds)
+    spacing = _extract_volume_spacing(ds)  # ordre natif (trame, ligne, colonne)
+    if spacing is not None:
+        s0, s1, s2 = spacing
+        spacing = (s1, s0, s2)  # même permutation (1,0,2) que le tableau ci-dessus
+    return arr.astype(np.float64), spacing
 
 
 def load_volume_from_folder(folder: Path):
     """Charge une série DICOM (une coupe par fichier) depuis un dossier.
 
-    Retourne (volume (Z,Y,X) float64, spacing_yx | None).
+    Retourne (volume (Z,Y,X) float64, spacing_zyx | None).
     """
     if sitk is not None:
         reader = sitk.ImageSeriesReader()
@@ -191,12 +304,18 @@ def load_volume_from_folder(folder: Path):
             reader.SetFileNames(names)
             img = reader.Execute()
             arr = _to_grayscale(sitk.GetArrayFromImage(img).astype(np.float64))  # (Z,Y,X)
+            try:
+                arr = _crop_to_region(arr, pydicom.dcmread(names[0], stop_before_pixels=True, force=True))
+            except Exception:
+                pass
             arr = np.transpose(arr, (1, 0, 2))
             #arr = np.transpose(arr, (2, 1, 0))
-            sx, sy, _sz = img.GetSpacing()
+            sx, sy, sz = img.GetSpacing()  # mm (convention SimpleITK/ITK)
             print(arr.shape)
             print('OK.....S')
-            return arr, (sy, sx)
+            # (Z,Y,X) natif = (sz,sy,sx) ; même permutation (1,0,2) que le
+            # tableau ci-dessus pour rester cohérent axe-par-axe. /10 : mm -> cm.
+            return arr, (sy / 10, sz / 10, sx / 10)
 
     # Repli sans SimpleITK (ou dossier non reconnu comme série GDCM).
     files = [p for p in sorted(folder.iterdir()) if p.is_file()]
@@ -210,7 +329,7 @@ def load_volume_from_file_list(paths: "list[Path]"):
     chacun), triés par InstanceNumber. Utilisé en repli pour un dossier scanné, et
     pour plusieurs fichiers déposés ensemble par glisser-déposer.
 
-    Retourne (volume (Z,Y,X) float64, spacing_yx | None).
+    Retourne (volume (Z,Y,X) float64, spacing_zyx | None).
     """
     datasets = []
     for p in paths:
@@ -222,11 +341,11 @@ def load_volume_from_file_list(paths: "list[Path]"):
         raise ValueError("Aucun fichier DICOM valide dans la sélection.")
 
     datasets.sort(key=lambda d: int(getattr(d, "InstanceNumber", 0)))
-    slices = [_to_grayscale(np.asarray(d.pixel_array)) for d in datasets]
+    slices = [_crop_to_region(_to_grayscale(np.asarray(d.pixel_array)), d) for d in datasets]
     if len({s.shape for s in slices}) != 1:
         raise ValueError("Les coupes DICOM sélectionnées n'ont pas toutes la même taille.")
     volume = np.stack(slices, axis=0).astype(np.float64)
-    return volume, _extract_spacing(datasets[0])
+    return volume, _extract_volume_spacing(datasets[0])
 
 
 def load_reference_image(path: Path):
@@ -236,6 +355,7 @@ def load_reference_image(path: Path):
     """
     ds = _read_dicom(path)
     arr = _to_grayscale(np.asarray(ds.pixel_array))
+    arr = _crop_to_region(arr, ds)
     if arr.ndim == 3 and arr.shape[0] == 1:
         arr = arr[0]
     if arr.ndim != 2:
@@ -426,7 +546,8 @@ class DicomViewerWindow(QMainWindow):
         self.btn_clear.clicked.connect(self.clear_all)
         sidebar.addWidget(self.btn_clear)
 
-        self.lbl_status = QLabel("Volume : non chargé\nRéférence : non chargée ")
+        self.lbl_status = QLabel("Volume : non chargé<br>Référence : non chargée")
+        self.lbl_status.setTextFormat(Qt.RichText)
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setStyleSheet(_STATUS_STYLE_NORMAL)
         sidebar.addWidget(self.lbl_status)
@@ -517,7 +638,41 @@ class DicomViewerWindow(QMainWindow):
         ax.axis('off')
         if view_type in ("axial", "coronal", "sagittal"):
             canvas.wheelEvent = lambda event: self.handle_scroll(event, view_type)
+
+        # Glisser-déposer directement sur le panneau : les 3 vues du volume
+        # chargent un volume, le panneau référence charge l'image sagittale.
+        canvas.setAcceptDrops(True)
+        canvas.dragEnterEvent = lambda event: self._canvas_drag_enter(event, canvas)
+        canvas.dragMoveEvent = lambda event: self._canvas_drag_enter(event, canvas)
+        canvas.dragLeaveEvent = lambda event: self._canvas_drag_leave(event, canvas)
+        canvas.dropEvent = lambda event: self._canvas_drop(event, view_type, canvas)
+        canvas.setToolTip(
+            "Glissez-déposez ici l'image sagittale de référence (DICOM)."
+            if view_type == "reference" else
+            "Glissez-déposez ici un fichier ou dossier DICOM pour charger le volume."
+        )
         return canvas, ax
+
+    def _canvas_drag_enter(self, event, canvas):
+        if event.mimeData().hasUrls():
+            canvas.figure.set_facecolor(_COLOR_HIGHLIGHT)
+            canvas.draw_idle()
+            event.acceptProposedAction()
+
+    def _canvas_drag_leave(self, event, canvas):
+        canvas.figure.set_facecolor('black')
+        canvas.draw_idle()
+
+    def _canvas_drop(self, event, view_type, canvas):
+        canvas.figure.set_facecolor('black')
+        canvas.draw_idle()
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            if view_type == "reference":
+                self.on_reference_dropped(paths)
+            else:
+                self.on_volume_dropped(paths)
+        event.acceptProposedAction()
 
     def _draw_placeholder(self, ax, text):
         ax.clear()
@@ -606,9 +761,20 @@ class DicomViewerWindow(QMainWindow):
         self._volume_thread = thread
         thread.start()
 
+    @staticmethod
+    def _resolve_spacing(spacing):
+        """Espacement (cm) par axe. L'inter-coupes (CORONAL, axe du balayage)
+        n'est renseigné par aucun tag DICOM pour les séquences échographiques
+        dynamiques (cf. investigation Patient5/I_000002) : on le force à 1.5x
+        l'espacement SAGITTAL (dans le plan), faute de mieux."""
+        if spacing is None:
+            return None
+        sz, _sy, sx = spacing
+        return (sz, 1.5 * sx, sx)
+
     def _on_volume_loaded(self, arr, spacing, source_label, directory: Path):
         self.volume = _to_uint8(arr)
-        self.volume_spacing = spacing
+        self.volume_spacing = self._resolve_spacing(spacing)
 
         for key, ax in (("ax", self.ax_ax), ("sag", self.ax_sag), ("cor", self.ax_cor)):
             art = self._plot_artists.pop(key, None)
@@ -717,18 +883,27 @@ class DicomViewerWindow(QMainWindow):
 
     def _update_status(self):
         self.lbl_status.setStyleSheet(_STATUS_STYLE_NORMAL)
-        lines = []
+        html = []
         if self.volume is not None:
+            # Dimension : les 3 axes (tous de vraies valeurs de pixel_array).
+            # Spacing : seulement AXIAL/SAGITTAL -- l'espacement CORONAL est
+            # une valeur forcée (1.5x sagittal), pas une mesure DICOM (cf.
+            # _resolve_spacing), donc pas affiché pour ne pas le faire passer
+            # pour tel.
             z, y, x = self.volume.shape
-            lines.append(f"Volume : {z}×{y}×{x} px, Pixel spacing : {_spacing_str(self.volume_spacing)}")
+            sz, _sy, sx = self.volume_spacing if self.volume_spacing else (None, None, None)
+            sp_str = f"{sz:.3g} × {sx:.3g}" if sz is not None and sx is not None else "?"
+            html.append(_spacing_table_html("Volume", f"{z} × {y} × {x}", sp_str))
         else:
-            lines.append("Volume : non chargé")
+            html.append(_spacing_table_html("Volume", None, None))
         if self.reference is not None:
             h, w = self.reference.shape
-            lines.append(f"Référence : {h}×{w} px, Pixel spacing : {_spacing_str(self.reference_spacing)}")
+            sy, sx = self.reference_spacing if self.reference_spacing else (None, None)
+            sp_str = f"{sy:.3g} × {sx:.3g}" if sy is not None and sx is not None else "?"
+            html.append(_spacing_table_html("Référence", f"{h} × {w}", sp_str))
         else:
-            lines.append("Référence : non chargée")
-        self.lbl_status.setText("\n".join(lines))
+            html.append(_spacing_table_html("Référence", None, None))
+        self.lbl_status.setText("".join(html))
 
     # ------------------------------------------------------------------
     # Rendu
@@ -750,6 +925,15 @@ class DicomViewerWindow(QMainWindow):
         except RuntimeError:
             pass  # fenêtre fermée avant l'exécution de la mise à jour différée
 
+    @staticmethod
+    def _view_aspect(row_spacing, col_spacing):
+        """Ratio d'aspect physique (cm/cm) pour qu'un panneau respecte les vraies
+        proportions anatomiques plutôt que le simple nombre de pixels. Retombe
+        sur 'equal' (pixels carrés) si l'un des deux espacements est inconnu."""
+        if row_spacing is None or col_spacing is None or col_spacing == 0:
+            return 'equal'
+        return row_spacing / col_spacing
+
     def update_plots(self):
         if self.volume is None:
             return
@@ -762,10 +946,15 @@ class DicomViewerWindow(QMainWindow):
         self.lbl_cor.setText(f"CORONAL (Slice {y + 1} / {self.volume.shape[1]})")
         self.lbl_sag.setText(f"SAGITTAL (Slice {x + 1} / {self.volume.shape[2]})")
 
-        def draw_image(key, ax, canvas, data, title, color, lh, lv, ch, cv, extra_text=None):
+        sz = sy = sx = None
+        if self.volume_spacing:
+            sz, sy, sx = self.volume_spacing
+
+        def draw_image(key, ax, canvas, data, title, color, lh, lv, ch, cv, aspect='equal',
+                       extra_text=None, axis_labels=None):
             art = self._plot_artists.get(key)
             if art is None:
-                im = ax.imshow(data, cmap='gray', aspect='equal', interpolation='nearest',
+                im = ax.imshow(data, cmap='gray', aspect=aspect, interpolation='nearest',
                                 vmin=0, vmax=255)
                 hline = ax.axhline(lh, color=ch, linewidth=0.8, alpha=0.6)
                 vline = ax.axvline(lv, color=cv, linewidth=0.8, alpha=0.6)
@@ -780,6 +969,16 @@ class DicomViewerWindow(QMainWindow):
                 if extra_text:
                     extra_artist = ax.figure.text(0.02, 0.02, extra_text, color=color,
                                                    fontsize=12, va='bottom')
+                # Repères d'axe : lettre du repère vertical (sens de lh/axhline,
+                # couleur ch) au bord gauche, lettre du repère horizontal (sens
+                # de lv/axvline, couleur cv) au bord bas -- mêmes couleurs que
+                # les traits de recoupement pour une association immédiate.
+                if axis_labels:
+                    v_letter, h_letter = axis_labels
+                    ax.figure.text(0.015, 0.5, v_letter, color=ch, fontweight='bold',
+                                   fontsize=14, va='center', ha='left')
+                    ax.figure.text(0.5, 0.015, h_letter, color=cv, fontweight='bold',
+                                   fontsize=14, va='bottom', ha='center')
                 self._plot_artists[key] = {
                     'im': im, 'hline': hline, 'vline': vline,
                     'title': title_artist, 'extra': extra_artist,
@@ -791,12 +990,14 @@ class DicomViewerWindow(QMainWindow):
             canvas.draw_idle()
 
         draw_image("ax", self.ax_ax, self.canvas_ax, self.volume[z, :, :],
-                   "AXIAL", _COLOR_AXIAL, y, x, "blue", "green")
+                   "AXIAL", _COLOR_AXIAL, y, x, "blue", "green",
+                   aspect=self._view_aspect(sy, sx), axis_labels=("X", "Y"))
         draw_image("sag", self.ax_sag, self.canvas_sag, self.volume[:, :, x],
-                   "SAGITTAL", _COLOR_SAGITTAL, z, y, "red", "blue")
+                   "SAGITTAL", _COLOR_SAGITTAL, z, y, "red", "blue",
+                   aspect=self._view_aspect(sz, sy), axis_labels=("Z", "X"))
         draw_image("cor", self.ax_cor, self.canvas_cor, self.volume[:, y, :],
                    "CORONAL", _COLOR_CORONAL, z, x, "red", "green",
-                   extra_text=_spacing_str(self.volume_spacing) if self.volume_spacing else None)
+                   aspect=self._view_aspect(sz, sx), axis_labels=("Z", "Y"))
 
     def _render_reference(self):
         self.ax_ref.clear()
@@ -814,14 +1015,20 @@ class DicomViewerWindow(QMainWindow):
         self._ref_title_artists = []
 
         if self.reference is not None:
-            self.ax_ref.imshow(self.reference, cmap='gray', aspect='equal',
+            ref_aspect = self._view_aspect(*self.reference_spacing) if self.reference_spacing else 'equal'
+            self.ax_ref.imshow(self.reference, cmap='gray', aspect=ref_aspect,
                                 interpolation='nearest', vmin=0, vmax=255)
             fig = self.ax_ref.figure
             t_title = fig.text(0.02, 0.98, "RÉFÉRENCE SAGITTALE",
                                 color=_COLOR_REFERENCE, fontweight='bold', fontsize=16, va='top')
-            t_spacing = fig.text(0.02, 0.02, _spacing_str(self.reference_spacing),
-                                  color=_COLOR_REFERENCE, fontsize=12, va='bottom')
-            self._ref_title_artists = [t_title, t_spacing]
+            # Repères d'axe, mêmes couleurs/convention que le panneau SAGITTAL
+            # (lignes=Z, colonnes=Y) puisque la référence représente le même
+            # type de plan.
+            t_label_v = fig.text(0.015, 0.5, "Z", color=_COLOR_AXIAL, fontweight='bold',
+                                  fontsize=14, va='center', ha='left')
+            t_label_h = fig.text(0.5, 0.015, "X", color=_COLOR_CORONAL, fontweight='bold',
+                                  fontsize=14, va='bottom', ha='center')
+            self._ref_title_artists = [t_title, t_label_v, t_label_h]
         else:
             self.ax_ref.text(0.5, 0.5, "Aucune image de référence\nchargée",
                               transform=self.ax_ref.transAxes, color="#555555",
